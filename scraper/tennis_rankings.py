@@ -1,130 +1,104 @@
 """
-Tennis rankings scraper.
-
-Uses ESPN's public rankings feed for ATP/WTA player rankings.
+ESPN-backed tennis rankings scraper.
 """
 
-from __future__ import annotations
-
-from typing import Iterable
-
 import pandas as pd
-import requests
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-}
+from .tennis_common import (
+    CORE_API_BASE,
+    DEFAULT_TOURS,
+    TOUR_LABELS,
+    fetch_json,
+    normalize_ref,
+    normalize_tours,
+    tour_slug,
+)
 
-RANKINGS_URLS = {
-    "ATP": "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/rankings",
-    "WTA": "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/rankings",
-}
 
 RANKING_COLUMNS = [
     "TOUR",
     "RANK",
     "PREVIOUS_RANK",
-    "POINTS",
+    "RANK_POINTS",
     "TREND",
     "PLAYER_ID",
-    "PLAYER_NAME",
+    "PLAYER",
     "SHORT_NAME",
-    "AGE",
-    "ACTIVE",
     "COUNTRY",
-    "COUNTRY_CODE",
-    "BIRTH_PLACE",
-    "RANKING_DATE",
-    "SOURCE",
-    "SOURCE_URL",
+    "AGE",
+    "HAND",
+    "ACTIVE",
+    "PLAYER_URL",
+    "LAST_UPDATED",
 ]
 
 
-def _normalize_tours(tours: Iterable[str]) -> tuple[str, ...]:
-    """Validate and normalize requested tours."""
-    normalized = []
-    for tour in tours:
-        upper = str(tour).upper()
-        if upper not in RANKINGS_URLS:
-            raise ValueError(f"Unsupported tennis tour: {tour}")
-        if upper not in normalized:
-            normalized.append(upper)
-    return tuple(normalized)
+def _get_ranking_payload(tour: str) -> dict:
+    """Fetch the latest ranking payload for a tour."""
+    index_url = f"{CORE_API_BASE}/leagues/{tour}/rankings"
+    index_payload = fetch_json(index_url)
+    ranking_ref = normalize_ref(index_payload["items"][0]["$ref"])
+    return fetch_json(ranking_ref)
 
 
-def _extract_country_code(flag_url: str | None) -> str | None:
-    """Extract a country code from ESPN's flag asset URL."""
-    if not flag_url:
-        return None
-    filename = flag_url.rsplit("/", 1)[-1]
-    return filename.split(".", 1)[0].upper()
-
-
-def _rows_for_tour(tour: str, limit: int | None) -> list[dict]:
-    """Fetch and normalize rankings for a single tour."""
-    response = requests.get(RANKINGS_URLS[tour], headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-
-    ranking_blocks = payload.get("rankings", [])
-    if not ranking_blocks:
-        return []
-
-    ranking_block = ranking_blocks[0]
-    ranking_date = ranking_block.get("update")
-    ranks = ranking_block.get("ranks", [])
-    if limit is not None:
-        ranks = ranks[:limit]
-
-    rows = []
-    for item in ranks:
-        athlete = item.get("athlete", {})
-        rows.append({
-            "TOUR": tour,
-            "RANK": item.get("current"),
-            "PREVIOUS_RANK": item.get("previous"),
-            "POINTS": item.get("points"),
-            "TREND": item.get("trend"),
-            "PLAYER_ID": athlete.get("id"),
-            "PLAYER_NAME": athlete.get("displayName"),
-            "SHORT_NAME": athlete.get("shortname") or athlete.get("shortName"),
-            "AGE": athlete.get("age"),
-            "ACTIVE": athlete.get("active"),
-            "COUNTRY": athlete.get("flagAltText") or athlete.get("citizenshipCountry"),
-            "COUNTRY_CODE": _extract_country_code(athlete.get("flag")),
-            "BIRTH_PLACE": athlete.get("birthPlace", {}).get("summary"),
-            "RANKING_DATE": ranking_date,
-            "SOURCE": "ESPN rankings",
-            "SOURCE_URL": RANKINGS_URLS[tour],
-        })
-
-    return rows
+def _get_athlete_payload(ref: str) -> dict:
+    """Fetch a player payload from an ESPN ref."""
+    return fetch_json(normalize_ref(ref))
 
 
 def get_tennis_rankings(
-    tours: Iterable[str] = ("ATP", "WTA"),
-    limit: int | None = 250,
+    tours: tuple[str, ...] = DEFAULT_TOURS,
+    top_n: int | None = 20,
+    limit: int | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch ATP/WTA player rankings.
+    Fetch the latest ATP and WTA rankings from ESPN.
 
-    Args:
-        tours: Iterable of tours to include
-        limit: Maximum players per tour, or None for all available entries
-
-    Returns:
-        DataFrame with ATP/WTA rankings and basic player metadata.
+    Returns a DataFrame with player identity, ranking points, and basic bio fields.
     """
     rows = []
-    for tour in _normalize_tours(tours):
-        rows.extend(_rows_for_tour(tour, limit=limit))
+    row_limit = limit if limit is not None else top_n
 
-    df = pd.DataFrame(rows, columns=RANKING_COLUMNS)
-    if df.empty:
-        return df
+    for tour in normalize_tours(tours):
+        ranking_payload = _get_ranking_payload(tour_slug(tour))
+        last_updated = ranking_payload.get("lastUpdated")
 
-    return df.sort_values(["TOUR", "RANK"], na_position="last").reset_index(drop=True)
+        ranks = ranking_payload.get("ranks", [])
+        if row_limit is not None:
+            ranks = ranks[:row_limit]
 
+        for rank_entry in ranks:
+            athlete = _get_athlete_payload(rank_entry["athlete"]["$ref"])
+            links = athlete.get("links", [])
+            player_url = next(
+                (link["href"] for link in links if "playercard" in link.get("rel", [])),
+                "",
+            )
+            country = athlete.get("citizenshipCountry", {}).get("abbreviation")
+            hand = athlete.get("hand", {}).get("displayValue")
+            status = athlete.get("status", {}).get("type")
 
-if __name__ == "__main__":
-    print(get_tennis_rankings(limit=10).to_string())
+            rows.append(
+                {
+                    "TOUR": TOUR_LABELS.get(tour, tour),
+                    "RANK": rank_entry.get("current"),
+                    "PREVIOUS_RANK": rank_entry.get("previous"),
+                    "RANK_POINTS": rank_entry.get("points"),
+                    "TREND": rank_entry.get("trend"),
+                    "PLAYER_ID": str(athlete.get("id")) if athlete.get("id") is not None else None,
+                    "PLAYER": athlete.get("displayName"),
+                    "SHORT_NAME": athlete.get("shortName"),
+                    "COUNTRY": country,
+                    "AGE": athlete.get("age"),
+                    "HAND": hand,
+                    "ACTIVE": status == "active",
+                    "PLAYER_URL": player_url,
+                    "LAST_UPDATED": last_updated,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=RANKING_COLUMNS)
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(["TOUR", "RANK", "PLAYER"]).reset_index(drop=True)

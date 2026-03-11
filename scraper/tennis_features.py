@@ -1,70 +1,120 @@
 """
-Tennis feature builder.
-
-Combines schedule, rankings, Elo ratings, and availability notes into a simple
-matchup feature table.
+Derived tennis feature builder.
 """
-
-from __future__ import annotations
 
 import math
 import re
 
 import pandas as pd
 
-from .tennis_injuries import get_tennis_injury_report
+from .tennis_injuries import get_tennis_injuries
 from .tennis_rankings import get_tennis_rankings
 from .tennis_schedule import get_tennis_schedule
-from .tennis_stats import get_tennis_player_stats
+from .tennis_stats import get_tennis_stats
+
 
 FEATURE_COLUMNS = [
     "MATCH_ID",
     "TOUR",
-    "EVENT_NAME",
+    "TOURNAMENT",
+    "DRAW",
     "ROUND",
-    "SCHEDULED_UTC",
-    "SURFACE",
-    "PLAYER_A",
-    "PLAYER_B",
-    "PLAYER_A_RANK",
-    "PLAYER_B_RANK",
-    "RANK_DELTA",
-    "PLAYER_A_ELO",
-    "PLAYER_B_ELO",
-    "ELO_DELTA_GLOBAL",
-    "ELO_DELTA_SURFACE",
-    "HOLD_BREAK_COMPOSITE_DELTA",
-    "FORM_DELTA",
-    "FATIGUE_DELTA",
-    "INJURY_STATUS_A",
-    "INJURY_STATUS_B",
-    "INJURY_FLAG_A",
-    "INJURY_FLAG_B",
-    "WITHDRAWAL_RISK_SCORE_A",
-    "WITHDRAWAL_RISK_SCORE_B",
-    "MODEL_WIN_PROB_A",
-    "MODEL_WIN_PROB_B",
-    "CONFIDENCE_GRADE",
+    "START_TIME_UTC",
+    "PLAYER_1",
+    "PLAYER_2",
+    "PLAYER_1_RANK",
+    "PLAYER_2_RANK",
+    "RANK_CHANGE",
+    "PLAYER_1_WIN_PCT",
+    "PLAYER_2_WIN_PCT",
+    "WIN_PCT_DELTA",
+    "PLAYER_1_TITLES",
+    "PLAYER_2_TITLES",
+    "TITLE_DELTA",
+    "PLAYER_1_INJURY_ARTICLES",
+    "PLAYER_2_INJURY_ARTICLES",
+    "PLAYER_1_HAS_INJURY_SIGNAL",
+    "PLAYER_2_HAS_INJURY_SIGNAL",
+    "PLAYER_1_LATEST_INJURY",
+    "PLAYER_2_LATEST_INJURY",
+    "MODEL_WIN_PROB_1",
+    "MODEL_WIN_PROB_2",
     "QUALITY_STATE",
 ]
 
-INJURY_SCORES = {
-    "available": 0.0,
-    "questionable": 0.35,
-    "likely_out": 0.75,
-    "withdrawn": 1.0,
-}
 
-
-def _normalize_player_name(value: str | None) -> str:
-    """Generate a loose player-name key for cross-source joins."""
+def _normalize_name(value: str | None) -> str:
+    """Normalize a player name for loose cross-source joins."""
     if not value:
         return ""
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def _safe_float(value: object) -> float | None:
-    """Convert a scalar to float when possible."""
+def _player_key(tour: str, player_id: str | None, player_name: str | None) -> tuple[str, str]:
+    """Build a lookup key using ESPN ids when possible."""
+    if player_id:
+        return tour, str(player_id)
+    return tour, _normalize_name(player_name)
+
+
+def _ranking_lookup(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """Index ranking rows by tour and player key."""
+    lookup = {}
+    if df.empty:
+        return lookup
+
+    for _, row in df.iterrows():
+        key = _player_key(row.get("TOUR"), row.get("PLAYER_ID"), row.get("PLAYER"))
+        if not key[1]:
+            continue
+        lookup[key] = row.to_dict()
+
+    return lookup
+
+
+def _stats_lookup(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """Index stats rows by tour and player key."""
+    lookup = {}
+    if df.empty:
+        return lookup
+
+    for _, row in df.iterrows():
+        key = _player_key(row.get("TOUR"), row.get("PLAYER_ID"), row.get("PLAYER"))
+        if not key[1]:
+            continue
+        lookup[key] = row.to_dict()
+
+    return lookup
+
+
+def _injury_lookup(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
+    """Collapse injury rows into one summary per player."""
+    lookup = {}
+    if df.empty:
+        return lookup
+
+    injury_players = df.copy()
+    injury_players = injury_players.sort_values("PUBLISHED_UTC", ascending=False)
+    for _, row in injury_players.iterrows():
+        key = _player_key(row.get("TOUR"), row.get("PLAYER_ID"), row.get("PLAYER"))
+        if not key[1]:
+            continue
+
+        current = lookup.get(key)
+        if current is None:
+            lookup[key] = {
+                "count": 1,
+                "headline": row.get("HEADLINE"),
+            }
+            continue
+
+        current["count"] += 1
+
+    return lookup
+
+
+def _safe_number(value: object) -> float | None:
+    """Convert a scalar into a float when possible."""
     if value is None or value is pd.NA:
         return None
     if pd.isna(value):
@@ -75,81 +125,116 @@ def _safe_float(value: object) -> float | None:
         return None
 
 
-def _build_lookup(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
-    """Index a DataFrame by tour and normalized player name."""
-    lookup: dict[tuple[str, str], dict] = {}
-    if df.empty:
-        return lookup
+def get_tennis_features(
+    schedule_df: pd.DataFrame | None = None,
+    rankings_df: pd.DataFrame | None = None,
+    stats_df: pd.DataFrame | None = None,
+    injuries_df: pd.DataFrame | None = None,
+    top_n: int | None = 64,
+) -> pd.DataFrame:
+    """
+    Build a lightweight matchup feature table from schedule, rankings, stats, and injury signals.
+    """
+    schedule_df = schedule_df if schedule_df is not None else get_tennis_schedule(include_completed=False)
+    rankings_df = rankings_df if rankings_df is not None else get_tennis_rankings(limit=top_n)
+    stats_df = stats_df if stats_df is not None else get_tennis_stats(limit=top_n)
+    injuries_df = injuries_df if injuries_df is not None else get_tennis_injuries()
 
-    for _, row in df.iterrows():
-        player_name = row.get("PLAYER_NAME")
-        key = (str(row.get("TOUR", "")).upper(), _normalize_player_name(player_name))
-        if not key[0] or not key[1]:
-            continue
-        lookup[key] = row.to_dict()
+    if schedule_df.empty:
+        return pd.DataFrame(columns=FEATURE_COLUMNS)
 
-    return lookup
+    ranking_lookup = _ranking_lookup(rankings_df)
+    stats_lookup = _stats_lookup(stats_df)
+    injury_lookup = _injury_lookup(injuries_df)
 
+    rows = []
+    for _, match in schedule_df.iterrows():
+        tour = match.get("TOUR")
+        player_1 = match.get("PLAYER_1")
+        player_2 = match.get("PLAYER_2")
 
-def _build_injury_lookup(df: pd.DataFrame) -> dict[tuple[str, str], dict]:
-    """Collapse multiple news hits into one severity-ranked injury record."""
-    lookup: dict[tuple[str, str], dict] = {}
-    if df.empty:
-        return lookup
+        key_1 = _player_key(tour, match.get("PLAYER_1_ID"), player_1)
+        key_2 = _player_key(tour, match.get("PLAYER_2_ID"), player_2)
 
-    ordered = df.sort_values(
-        ["CONFIDENCE", "SOURCE_TS"],
-        ascending=[False, False],
-        na_position="last",
-    )
+        ranking_1 = ranking_lookup.get(key_1, {})
+        ranking_2 = ranking_lookup.get(key_2, {})
+        stats_1 = stats_lookup.get(key_1, {})
+        stats_2 = stats_lookup.get(key_2, {})
+        injury_1 = injury_lookup.get(key_1, {})
+        injury_2 = injury_lookup.get(key_2, {})
 
-    for _, row in ordered.iterrows():
-        key = (str(row.get("TOUR", "")).upper(), _normalize_player_name(row.get("PLAYER_NAME")))
-        if not key[0] or not key[1]:
-            continue
+        rank_1 = _safe_number(ranking_1.get("RANK"))
+        rank_2 = _safe_number(ranking_2.get("RANK"))
+        rank_change = (rank_2 - rank_1) if rank_1 is not None and rank_2 is not None else None
 
-        severity = INJURY_SCORES.get(row.get("STATUS"), 0.0)
-        current = lookup.get(key)
-        if current is None or severity > current["severity"]:
-            payload = row.to_dict()
-            payload["severity"] = severity
-            lookup[key] = payload
+        win_pct_1 = _safe_number(stats_1.get("WIN_PCT"))
+        win_pct_2 = _safe_number(stats_2.get("WIN_PCT"))
+        win_pct_delta = (win_pct_1 - win_pct_2) if win_pct_1 is not None and win_pct_2 is not None else None
 
-    return lookup
+        titles_1 = _safe_number(stats_1.get("SINGLES_TITLES"))
+        titles_2 = _safe_number(stats_2.get("SINGLES_TITLES"))
+        title_delta = (titles_1 - titles_2) if titles_1 is not None and titles_2 is not None else None
 
+        injury_count_1 = int(injury_1.get("count", 0))
+        injury_count_2 = int(injury_2.get("count", 0))
 
-def _surface_elo(stats_row: dict | None, surface: object) -> float | None:
-    """Select the most relevant Elo for a match surface."""
-    if not stats_row:
-        return None
+        score = 0.0
+        available_signals = 0
+        if rank_change is not None:
+            score += max(min(rank_change, 100.0), -100.0) * 0.03
+            available_signals += 1
+        if win_pct_delta is not None:
+            score += win_pct_delta * 2.5
+            available_signals += 1
+        if title_delta is not None:
+            score += max(min(title_delta, 5.0), -5.0) * 0.15
+            available_signals += 1
 
-    surface_name = str(surface).lower() if surface is not None and surface is not pd.NA else ""
-    if surface_name == "clay":
-        return _safe_float(stats_row.get("ELO_CLAY"))
-    if surface_name == "grass":
-        return _safe_float(stats_row.get("ELO_GRASS"))
-    if surface_name in {"hard", "indoor_hard"}:
-        return _safe_float(stats_row.get("ELO_HARD"))
+        score += (injury_count_2 - injury_count_1) * 0.2
+        model_win_prob_1 = 1.0 / (1.0 + math.exp(-score))
+        model_win_prob_2 = 1.0 - model_win_prob_1
 
-    # TODO: use tournament-level surface metadata so this does not have to
-    # fall back to a generic rating for hard/indoor-hard ambiguity.
-    return _safe_float(stats_row.get("ELO_GLOBAL"))
+        if available_signals >= 3:
+            quality_state = "complete"
+        elif available_signals >= 1:
+            quality_state = "partial"
+        else:
+            quality_state = "sparse"
 
+        rows.append(
+            {
+                "MATCH_ID": match.get("MATCH_ID"),
+                "TOUR": tour,
+                "TOURNAMENT": match.get("TOURNAMENT"),
+                "DRAW": match.get("DRAW"),
+                "ROUND": match.get("ROUND"),
+                "START_TIME_UTC": match.get("START_TIME_UTC"),
+                "PLAYER_1": player_1,
+                "PLAYER_2": player_2,
+                "PLAYER_1_RANK": rank_1,
+                "PLAYER_2_RANK": rank_2,
+                "RANK_CHANGE": rank_change,
+                "PLAYER_1_WIN_PCT": win_pct_1,
+                "PLAYER_2_WIN_PCT": win_pct_2,
+                "WIN_PCT_DELTA": win_pct_delta,
+                "PLAYER_1_TITLES": titles_1,
+                "PLAYER_2_TITLES": titles_2,
+                "TITLE_DELTA": title_delta,
+                "PLAYER_1_INJURY_ARTICLES": injury_count_1,
+                "PLAYER_2_INJURY_ARTICLES": injury_count_2,
+                "PLAYER_1_HAS_INJURY_SIGNAL": injury_count_1 > 0,
+                "PLAYER_2_HAS_INJURY_SIGNAL": injury_count_2 > 0,
+                "PLAYER_1_LATEST_INJURY": injury_1.get("headline"),
+                "PLAYER_2_LATEST_INJURY": injury_2.get("headline"),
+                "MODEL_WIN_PROB_1": round(model_win_prob_1, 4),
+                "MODEL_WIN_PROB_2": round(model_win_prob_2, 4),
+                "QUALITY_STATE": quality_state,
+            }
+        )
 
-def _grade_confidence(
-    quality_state: str,
-    surface_known: bool,
-    injury_status_a: str,
-    injury_status_b: str,
-) -> str:
-    """Assign a simple confidence grade to a feature row."""
-    if "withdrawn" in {injury_status_a, injury_status_b}:
-        return "C"
-    if quality_state == "complete" and surface_known:
-        return "A"
-    if quality_state in {"complete", "partial"}:
-        return "B"
-    return "C"
+    return pd.DataFrame(rows, columns=FEATURE_COLUMNS).sort_values(
+        ["START_TIME_UTC", "TOUR", "TOURNAMENT", "ROUND"]
+    ).reset_index(drop=True)
 
 
 def build_tennis_features(
@@ -157,154 +242,13 @@ def build_tennis_features(
     rankings_df: pd.DataFrame | None = None,
     stats_df: pd.DataFrame | None = None,
     injuries_df: pd.DataFrame | None = None,
+    top_n: int | None = 64,
 ) -> pd.DataFrame:
-    """
-    Build matchup features from the available tennis source tables.
-
-    This is intentionally heuristic: it provides a stable scaffold for future
-    feature engineering without pretending to be a production tennis model.
-    """
-    if schedule_df is None:
-        schedule_df = get_tennis_schedule(include_completed=False)
-    if rankings_df is None:
-        rankings_df = get_tennis_rankings(limit=None)
-    if stats_df is None:
-        stats_df = get_tennis_player_stats()
-    if injuries_df is None:
-        injuries_df = get_tennis_injury_report()
-
-    if schedule_df.empty:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
-
-    ranking_lookup = _build_lookup(rankings_df)
-    stats_lookup = _build_lookup(stats_df)
-    injury_lookup = _build_injury_lookup(injuries_df)
-
-    rows = []
-    for _, match in schedule_df.iterrows():
-        tour = str(match.get("TOUR", "")).upper()
-        player_a = match.get("PLAYER_A")
-        player_b = match.get("PLAYER_B")
-
-        key_a = (tour, _normalize_player_name(player_a))
-        key_b = (tour, _normalize_player_name(player_b))
-
-        ranking_a = ranking_lookup.get(key_a, {})
-        ranking_b = ranking_lookup.get(key_b, {})
-        stats_a = stats_lookup.get(key_a, {})
-        stats_b = stats_lookup.get(key_b, {})
-        injury_a = injury_lookup.get(key_a)
-        injury_b = injury_lookup.get(key_b)
-
-        rank_a = _safe_float(ranking_a.get("RANK"))
-        rank_b = _safe_float(ranking_b.get("RANK"))
-        elo_global_a = _safe_float(stats_a.get("ELO_GLOBAL"))
-        elo_global_b = _safe_float(stats_b.get("ELO_GLOBAL"))
-        elo_surface_a = _surface_elo(stats_a, match.get("SURFACE"))
-        elo_surface_b = _surface_elo(stats_b, match.get("SURFACE"))
-
-        rank_delta = (rank_b - rank_a) if rank_a is not None and rank_b is not None else None
-        elo_delta_global = (
-            elo_global_a - elo_global_b
-            if elo_global_a is not None and elo_global_b is not None
-            else None
-        )
-        elo_delta_surface = (
-            elo_surface_a - elo_surface_b
-            if elo_surface_a is not None and elo_surface_b is not None
-            else None
-        )
-
-        injury_status_a = injury_a.get("STATUS", "available") if injury_a else "available"
-        injury_status_b = injury_b.get("STATUS", "available") if injury_b else "available"
-        risk_a = injury_a.get("severity", 0.0) if injury_a else 0.0
-        risk_b = injury_b.get("severity", 0.0) if injury_b else 0.0
-
-        if injury_status_a == "withdrawn":
-            model_win_prob_a = 0.01
-        elif injury_status_b == "withdrawn":
-            model_win_prob_a = 0.99
-        else:
-            score = 0.0
-            if elo_delta_surface is not None:
-                score += 0.7 * elo_delta_surface
-            if elo_delta_global is not None:
-                score += (0.3 if elo_delta_surface is not None else 1.0) * elo_delta_global
-            if rank_delta is not None:
-                score += max(min(rank_delta, 75.0), -75.0) * 4.0
-            score += (risk_b - risk_a) * 120.0
-            model_win_prob_a = 1.0 / (1.0 + math.pow(10.0, -score / 400.0))
-
-        model_win_prob_b = 1.0 - model_win_prob_a
-
-        completeness = sum(
-            value is not None
-            for value in [rank_a, rank_b, elo_global_a, elo_global_b]
-        )
-        if completeness == 4:
-            quality_state = "complete"
-        elif completeness >= 2:
-            quality_state = "partial"
-        else:
-            quality_state = "sparse"
-
-        surface_value = match.get("SURFACE")
-        surface_known = bool(surface_value is not None and surface_value is not pd.NA and not pd.isna(surface_value))
-
-        rows.append({
-            "MATCH_ID": match.get("MATCH_ID"),
-            "TOUR": tour,
-            "EVENT_NAME": match.get("EVENT_NAME"),
-            "ROUND": match.get("ROUND"),
-            "SCHEDULED_UTC": match.get("SCHEDULED_UTC"),
-            "SURFACE": match.get("SURFACE"),
-            "PLAYER_A": player_a,
-            "PLAYER_B": player_b,
-            "PLAYER_A_RANK": rank_a,
-            "PLAYER_B_RANK": rank_b,
-            "RANK_DELTA": rank_delta if rank_delta is not None else pd.NA,
-            "PLAYER_A_ELO": elo_surface_a if elo_surface_a is not None else elo_global_a,
-            "PLAYER_B_ELO": elo_surface_b if elo_surface_b is not None else elo_global_b,
-            "ELO_DELTA_GLOBAL": elo_delta_global if elo_delta_global is not None else pd.NA,
-            "ELO_DELTA_SURFACE": elo_delta_surface if elo_delta_surface is not None else pd.NA,
-            # TODO: populate these once hold/break and recent-form sources are wired in.
-            "HOLD_BREAK_COMPOSITE_DELTA": pd.NA,
-            "FORM_DELTA": pd.NA,
-            "FATIGUE_DELTA": pd.NA,
-            "INJURY_STATUS_A": injury_status_a,
-            "INJURY_STATUS_B": injury_status_b,
-            "INJURY_FLAG_A": injury_status_a != "available",
-            "INJURY_FLAG_B": injury_status_b != "available",
-            "WITHDRAWAL_RISK_SCORE_A": risk_a,
-            "WITHDRAWAL_RISK_SCORE_B": risk_b,
-            "MODEL_WIN_PROB_A": round(model_win_prob_a, 4),
-            "MODEL_WIN_PROB_B": round(model_win_prob_b, 4),
-            "CONFIDENCE_GRADE": _grade_confidence(
-                quality_state=quality_state,
-                surface_known=surface_known,
-                injury_status_a=injury_status_a,
-                injury_status_b=injury_status_b,
-            ),
-            "QUALITY_STATE": quality_state,
-        })
-
-    return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
-
-
-def get_tennis_features(
-    schedule_df: pd.DataFrame | None = None,
-    rankings_df: pd.DataFrame | None = None,
-    stats_df: pd.DataFrame | None = None,
-    injuries_df: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """Alias for the tennis feature builder."""
-    return build_tennis_features(
+    """Backward-compatible alias for the tennis feature builder."""
+    return get_tennis_features(
         schedule_df=schedule_df,
         rankings_df=rankings_df,
         stats_df=stats_df,
         injuries_df=injuries_df,
+        top_n=top_n,
     )
-
-
-if __name__ == "__main__":
-    print(build_tennis_features().head(20).to_string())

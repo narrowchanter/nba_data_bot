@@ -4,7 +4,7 @@ from .injury_report import get_injury_report
 from .tennis_schedule import get_tennis_schedule
 from .tennis_rankings import get_tennis_rankings
 from .tennis_stats import get_tennis_player_stats, get_tennis_stats
-from .tennis_injuries import get_tennis_injury_report
+from .tennis_injuries import get_tennis_injury_report, get_tennis_injuries
 from .tennis_features import build_tennis_features, get_tennis_features
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "get_tennis_player_stats",
     "get_tennis_stats",
     "get_tennis_injury_report",
+    "get_tennis_injuries",
     "build_tennis_features",
     "get_tennis_features",
 ]

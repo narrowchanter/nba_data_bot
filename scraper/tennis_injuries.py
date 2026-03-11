@@ -1,196 +1,130 @@
 """
-Tennis injury and availability scraper.
-
-This is a best-effort ATP/WTA availability feed built from ESPN tennis news.
+Keyword-based tennis injury signal scraper.
 """
-
-from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import re
-from typing import Iterable
 
 import pandas as pd
-import requests
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-}
+from .tennis_common import DEFAULT_TOURS, SITE_API_BASE, TOUR_LABELS, fetch_json, normalize_tours, tour_slug
 
-NEWS_URLS = {
-    "ATP": "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/news",
-    "WTA": "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/news",
-}
 
-STATUS_PATTERNS = [
-    (
-        "withdrawn",
-        0.95,
-        [
-            r"\bwithdraw(?:s|n|al)?\b",
-            r"\bpulls?\s+out\b",
-        ],
-    ),
-    (
-        "likely_out",
-        0.8,
-        [
-            r"\bout\s+for\b",
-            r"\bout\s+with\b",
-            r"\bwill\s+miss\b",
-            r"\bmiss(?:es|ing)?\b",
-            r"\bsurgery\b",
-            r"\billness\b",
-            r"\bretire(?:s|d|ment)?\b",
-        ],
-    ),
-    (
-        "questionable",
-        0.55,
-        [
-            r"\bmedical timeout\b",
-            r"\binjury scare\b",
-            r"\bfitness concern\b",
-            r"\bhampered by\b",
-            r"\bnursing\b",
-            r"\bphysical issue\b",
-        ],
-    ),
-]
+DEFAULT_INJURY_KEYWORDS = (
+    "injury",
+    "injured",
+    "withdraw",
+    "withdrew",
+    "withdrawal",
+    "retire",
+    "retired",
+    "illness",
+    "pain",
+    "ankle",
+    "arm",
+    "back",
+    "elbow",
+    "hamstring",
+    "hip",
+    "knee",
+    "shoulder",
+    "wrist",
+)
 
 INJURY_COLUMNS = [
     "TOUR",
+    "ARTICLE_ID",
     "PLAYER_ID",
-    "PLAYER_NAME",
-    "STATUS",
-    "CONFIDENCE",
-    "SOURCE_TS",
+    "PLAYER",
     "HEADLINE",
-    "SUMMARY",
-    "SOURCE",
-    "SOURCE_URL",
+    "DESCRIPTION",
+    "PUBLISHED_UTC",
+    "URL",
+    "SIGNAL_KEYWORDS",
 ]
 
 
-def _normalize_tours(tours: Iterable[str]) -> tuple[str, ...]:
-    """Validate and normalize requested tours."""
-    normalized = []
-    for tour in tours:
-        upper = str(tour).upper()
-        if upper not in NEWS_URLS:
-            raise ValueError(f"Unsupported tennis tour: {tour}")
-        if upper not in normalized:
-            normalized.append(upper)
-    return tuple(normalized)
-
-
 def _parse_timestamp(value: str | None) -> datetime | None:
-    """Parse an ISO-8601 timestamp into a timezone-aware datetime."""
+    """Parse an ISO timestamp into a timezone-aware datetime."""
     if not value:
         return None
+
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
 
 
-def _classify_status(text: str) -> tuple[str | None, float | None]:
-    """Map headline/description text into a normalized status bucket."""
-    lowered = text.lower()
-    for status, confidence, patterns in STATUS_PATTERNS:
-        if any(re.search(pattern, lowered) for pattern in patterns):
-            return status, confidence
-    return None, None
-
-
-def _extract_players(article: dict) -> list[tuple[int | None, str]]:
-    """Extract player metadata from ESPN article categories."""
-    players = []
-    seen = set()
-
-    for category in article.get("categories", []):
-        if category.get("type") != "athlete":
-            continue
-
-        athlete_id = category.get("athleteId") or category.get("athlete", {}).get("id")
-        player_name = category.get("description") or category.get("athlete", {}).get("description")
-        if not player_name:
-            continue
-
-        key = (athlete_id, player_name)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        players.append(key)
-
-    return players
-
-
-def get_tennis_injury_report(
-    tours: Iterable[str] = ("ATP", "WTA"),
-    lookback_days: int = 14,
+def get_tennis_injuries(
+    tours: tuple[str, ...] = DEFAULT_TOURS,
+    keywords: tuple[str, ...] = DEFAULT_INJURY_KEYWORDS,
+    lookback_days: int | None = 14,
 ) -> pd.DataFrame:
     """
-    Fetch a best-effort tennis availability feed.
+    Fetch tennis injury signals from ESPN news headlines and blurbs.
 
-    Args:
-        tours: Iterable of tours to include
-        lookback_days: Only keep recent availability/injury articles
-
-    Returns:
-        DataFrame keyed by player/article mention with normalized status labels.
+    TODO: Replace this heuristic with a structured injury/withdrawal feed if one
+    becomes reliably available without authentication.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     rows = []
+    pattern = re.compile("|".join(re.escape(keyword) for keyword in keywords), re.IGNORECASE)
+    seen_rows = set()
+    cutoff = None
+    if lookback_days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-    for tour in _normalize_tours(tours):
-        response = requests.get(NEWS_URLS[tour], headers=HEADERS, timeout=30)
-        response.raise_for_status()
-        payload = response.json()
+    for tour in normalize_tours(tours):
+        news_url = f"{SITE_API_BASE}/{tour_slug(tour)}/news"
+        payload = fetch_json(news_url)
 
         for article in payload.get("articles", []):
-            source_ts = _parse_timestamp(article.get("published") or article.get("lastModified"))
-            if source_ts is not None and source_ts < cutoff:
+            published = article.get("published") or article.get("lastModified")
+            published_dt = _parse_timestamp(published)
+            if cutoff is not None and published_dt is not None and published_dt < cutoff:
                 continue
 
             headline = article.get("headline", "")
-            summary = article.get("description", "")
-            status, confidence = _classify_status(f"{headline} {summary}")
-            if not status:
+            description = article.get("description", "")
+            haystack = " ".join(part for part in [headline, description] if part)
+            matches = sorted({match.group(0).lower() for match in pattern.finditer(haystack)})
+            if not matches:
                 continue
 
-            players = _extract_players(article)
-            if not players:
-                continue
+            athletes = [item for item in article.get("categories", []) if item.get("type") == "athlete"]
+            if not athletes:
+                athletes = [{"athleteId": None, "description": None}]
 
-            source_url = article.get("links", {}).get("web", {}).get("href")
-            for player_id, player_name in players:
-                rows.append({
-                    "TOUR": tour,
-                    "PLAYER_ID": player_id,
-                    "PLAYER_NAME": player_name,
-                    "STATUS": status,
-                    "CONFIDENCE": confidence,
-                    "SOURCE_TS": source_ts.isoformat() if source_ts else None,
-                    "HEADLINE": headline,
-                    "SUMMARY": summary,
-                    # TODO: replace this keyword classifier with official withdrawal
-                    # lists or medical-status feeds once a stable source is chosen.
-                    "SOURCE": "ESPN news keyword classifier",
-                    "SOURCE_URL": source_url,
-                })
+            for athlete in athletes:
+                row_key = (article.get("id"), athlete.get("athleteId"))
+                if row_key in seen_rows:
+                    continue
 
-    df = pd.DataFrame(rows, columns=INJURY_COLUMNS)
-    if df.empty:
-        return df
+                seen_rows.add(row_key)
+                rows.append(
+                    {
+                        "TOUR": TOUR_LABELS.get(tour, tour),
+                        "ARTICLE_ID": article.get("id"),
+                        "PLAYER_ID": str(athlete.get("athleteId")) if athlete.get("athleteId") is not None else None,
+                        "PLAYER": athlete.get("description"),
+                        "HEADLINE": headline,
+                        "DESCRIPTION": description,
+                        "PUBLISHED_UTC": published_dt.isoformat() if published_dt else published,
+                        "URL": article.get("links", {}).get("web", {}).get("href"),
+                        "SIGNAL_KEYWORDS": ",".join(matches),
+                    }
+                )
 
-    return df.sort_values(
-        ["SOURCE_TS", "TOUR", "PLAYER_NAME"],
-        ascending=[False, True, True],
-        na_position="last",
-    ).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=INJURY_COLUMNS)
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(["PUBLISHED_UTC", "TOUR", "PLAYER"], ascending=[False, True, True]).reset_index(drop=True)
 
 
-if __name__ == "__main__":
-    print(get_tennis_injury_report().to_string())
+def get_tennis_injury_report(
+    tours: tuple[str, ...] = DEFAULT_TOURS,
+    keywords: tuple[str, ...] = DEFAULT_INJURY_KEYWORDS,
+    lookback_days: int | None = 14,
+) -> pd.DataFrame:
+    """Backward-compatible alias for news-based injury signals."""
+    return get_tennis_injuries(tours=tours, keywords=keywords, lookback_days=lookback_days)
