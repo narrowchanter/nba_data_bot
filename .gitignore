@@ -1,5 +1,6 @@
 # Output files
 output/
+outputs/
 
 # Python
 __pycache__/
