@@ -47,6 +47,8 @@ Output files are saved to `./output/` by default with timestamps (e.g., `advance
 
 The EPL pathway is scaffolded separately in `epl_main.py` so downstream consumers can integrate against committed markdown outputs while live EPL ingestion is still landing.
 
+Official EPL availability ingestion is available via `scraper/epl_availability.py`, which reads the public Premier League bootstrap feed and normalizes player status into `available`, `questionable`, `out`, `suspended`, and `unknown` buckets.
+
 ```bash
 # Generate all EPL markdown outputs in ./data
 python3 epl_main.py markdown
@@ -112,7 +114,8 @@ nba_data_bot/
 ├── scraper/
 │   ├── teamrankings.py        # Last-5 form scraper
 │   ├── nba_stats.py           # NBA.com stats API client
-│   └── injury_report.py       # Injury report PDF parser
+│   ├── injury_report.py       # Injury report PDF parser
+│   └── epl_availability.py    # EPL availability bootstrap feed client
 ├── scripts/
 │   ├── update_and_push.sh     # NBA update and push script
 │   └── update_epl_and_push.sh # EPL update and push script
