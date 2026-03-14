@@ -1,38 +1,59 @@
 # EPL Match Data
 
-**Last Updated:** TEMPLATE UTC
-**Mode:** Pipeline scaffold
+**Last Updated:** 2026-03-14 00:00 UTC
+**Mode:** Pipeline scaffold with player stats, injuries, and sanity coverage
 
 ## Data Sources
 
-| Source | Website | Status | Records | Notes |
+| source | website | status | records | notes |
 |--------|---------|--------|---------|-------|
-| Fixtures | premierleague.com | TEMPLATE | 0 | Placeholder until fixture ingestion lands |
-| Table Snapshot | premierleague.com/tables | TEMPLATE | 0 | Placeholder until standings ingestion lands |
-| Team Form | derived rolling window | TEMPLATE | 0 | Placeholder until recent-form features land |
-| Availability | club reports and news feeds | TEMPLATE | 0 | Placeholder until availability ingestion lands |
-| Market Mapping | execution venue | OPTIONAL | 0 | Placeholder until market adapter lands |
+| Fixtures | premierleague.com | SCAFFOLD | 1 | Sample fixture row is wired through the feature join. |
+| Table Snapshot | premierleague.com/tables | SCAFFOLD | 2 | Home and away strength rows feed matchup deltas. |
+| Team Form | derived rolling window | SCAFFOLD | 2 | Five-match form rows back the form delta columns. |
+| Player Stats | club and event feeds | SCAFFOLD | 4 | Top player production rows are rendered as a separate section. |
+| Injuries | club reports and news feeds | SCAFFOLD | 3 | Injury watch rows stay separate from feature deltas for clarity. |
+| Market Mapping | execution venue | OPTIONAL | 0 | Venue adapter remains outside the scaffolded pipeline. |
 
 ## Candidate Matches
 
 | match_id | kickoff_utc | home_team | away_team | venue | model_home_win | model_draw | model_away_win | quality_state |
 |----------|-------------|-----------|-----------|-------|----------------|------------|----------------|---------------|
-| example_epl_arsenal_chelsea_2026-03-14 | 2026-03-14 15:00 UTC | Arsenal | Chelsea | Emirates Stadium | TBD | TBD | TBD | TEMPLATE |
+| sample_epl_arsenal_chelsea_2026-03-14 | 2026-03-14 15:00 UTC | Arsenal | Chelsea | Emirates Stadium | 0.52 | 0.25 | 0.23 | sanity_checked |
 
 ## Match Features
 
-| match_id | table_position_delta | points_delta | goal_diff_delta | xg_delta | rest_days_delta | injuries_home | injuries_away | market_alignment |
-|----------|----------------------|--------------|-----------------|----------|-----------------|---------------|---------------|------------------|
-| example_epl_arsenal_chelsea_2026-03-14 | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| match_id | table_position_delta | points_delta | goal_diff_delta | form_points_delta | rest_days_delta | player_goal_contrib_delta | player_shots_on_target_delta | injuries_home | injuries_away | quality_state |
+|----------|----------------------|--------------|-----------------|-------------------|-----------------|---------------------------|------------------------------|---------------|---------------|---------------|
+| sample_epl_arsenal_chelsea_2026-03-14 | 3 | 10 | 16 | 4 | 1 | 4 | 3 | 1 | 2 | ready |
 
-## Availability Watch
+## Player Stats Snapshot
 
-| team | player | status | source | confidence | note |
-|------|--------|--------|--------|------------|------|
-| Arsenal | Player A | available | placeholder | 0.00 | Replace with normalized availability feed |
-| Chelsea | Player B | questionable | placeholder | 0.00 | Replace with normalized availability feed |
+| team | player | window | goals | assists | shots_on_target | chances_created | note |
+|------|--------|--------|-------|---------|-----------------|-----------------|------|
+| Arsenal | Bukayo Saka | Last 5 | 3 | 2 | 8 | 11 | Primary right-side creator. |
+| Arsenal | Martin Odegaard | Last 5 | 1 | 3 | 3 | 14 | Set-piece volume remains strong. |
+| Chelsea | Cole Palmer | Last 5 | 2 | 2 | 5 | 10 | Carries the highest direct goal involvement. |
+| Chelsea | Nicolas Jackson | Last 5 | 1 | 0 | 3 | 2 | Penalty-box shot volume is stable. |
+
+## Injury Watch
+
+| team | player | status | expected_return | source | confidence | impact_note |
+|------|--------|--------|-----------------|--------|------------|-------------|
+| Arsenal | Gabriel Jesus | out | 2026-03-21 | club report | 0.92 | Removes a central rotation forward. |
+| Chelsea | Reece James | questionable | day to day | press conference | 0.74 | Touches both flank progression and set-piece share. |
+| Chelsea | Romeo Lavia | out | 2026-03-28 | club report | 0.89 | Reduces central midfield ball-winning depth. |
+
+## Sanity Checks
+
+| check | result | detail |
+|-------|--------|--------|
+| candidate_row_schema | PASS | 1 candidate row validated with required feature columns present. |
+| source_freshness | PASS | Oldest scaffold source age is 3.5h, inside the 48h window. |
+| player_stats_match_coverage | PASS | Both clubs have player-stat coverage in the rendered snapshot. |
+| injury_feed_alignment | PASS | All injury rows map cleanly to the candidate match clubs. |
 
 ## Publishing Notes
 
-- Generated by `python3 epl_main.py markdown --output ./data`
-- Replace placeholder rows with live data once EPL ingestion commands land.
+- Generated by `python3 epl_main.py markdown --output ./data`.
+- Player stats and injuries remain scaffold-backed until live EPL ingestion lands.
+- Candidate row validation is sourced from `epl.features.sanity_check_candidate_rows`.

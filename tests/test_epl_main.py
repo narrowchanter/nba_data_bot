@@ -30,6 +30,44 @@ class EPLMainDispatchTests(unittest.TestCase):
                 self.assertEqual(parsed_args.output, "./data")
 
 
+class EPLMainRenderTests(unittest.TestCase):
+    def test_render_epl_data_includes_player_stats_injuries_and_sanity_sections(self):
+        content = epl_main.render_epl_data(epl_main.LAST_UPDATED)
+
+        self.assertIn("# EPL Match Data", content)
+        self.assertIn("## Match Features", content)
+        self.assertIn("## Player Stats Snapshot", content)
+        self.assertIn("## Injury Watch", content)
+        self.assertIn("## Sanity Checks", content)
+        self.assertIn("Bukayo Saka", content)
+        self.assertIn("Reece James", content)
+        self.assertIn("| team | player | window | goals | assists | shots_on_target | chances_created | note |", content)
+
+    def test_render_epl_matches_today_includes_injury_watch_and_refresh_fields(self):
+        content = epl_main.render_epl_matches_today(epl_main.LAST_UPDATED)
+
+        self.assertIn("# EPL Matches Today", content)
+        self.assertIn("## Injury Watch", content)
+        self.assertIn("## Pre-Kickoff Watchlist", content)
+        self.assertIn("player_stats_refresh", content)
+        self.assertIn("injury_refresh", content)
+
+    def test_render_epl_quality_report_includes_new_quality_metrics(self):
+        content = epl_main.render_epl_quality_report(epl_main.LAST_UPDATED)
+
+        self.assertIn("# EPL Quality Report", content)
+        self.assertIn("## Run Summary", content)
+        self.assertIn("## Coverage", content)
+        self.assertIn("## Guardrails", content)
+        self.assertIn("## Sanity Checks", content)
+        self.assertIn("| player_stats_rows | 4 |", content)
+        self.assertIn("| injury_rows | 3 |", content)
+        self.assertIn("| matches_with_player_stats | 1 |", content)
+        self.assertIn("| matches_with_injury_data | 1 |", content)
+        self.assertIn("| candidate_row_schema | PASS |", content)
+        self.assertIn("| player_stats_shape | PASS |", content)
+
+
 class EPLMainSmokeTests(unittest.TestCase):
     def test_cmd_markdown_writes_expected_epl_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -51,13 +89,14 @@ class EPLMainSmokeTests(unittest.TestCase):
             matches_content = matches_path.read_text(encoding="utf-8")
             quality_content = quality_path.read_text(encoding="utf-8")
 
-            self.assertIn("# EPL Match Data", data_content)
-            self.assertIn("## Candidate Matches", data_content)
-            self.assertIn("Arsenal", data_content)
-            self.assertIn("# EPL Matches Today", matches_content)
-            self.assertIn("## Pre-Kickoff Watchlist", matches_content)
-            self.assertIn("# EPL Quality Report", quality_content)
-            self.assertIn("## Guardrails", quality_content)
+            self.assertIn("## Player Stats Snapshot", data_content)
+            self.assertIn("## Injury Watch", data_content)
+            self.assertIn("## Sanity Checks", data_content)
+            self.assertIn("## Injury Watch", matches_content)
+            self.assertIn("player_stats_refresh", matches_content)
+            self.assertIn("## Coverage", quality_content)
+            self.assertIn("| player_stats_rows | 4 |", quality_content)
+            self.assertIn("| injury_rows | 3 |", quality_content)
 
 
 if __name__ == "__main__":
