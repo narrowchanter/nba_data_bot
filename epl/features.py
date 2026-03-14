@@ -43,6 +43,40 @@ TEAM_FORM_COLUMNS = (
     "updated_at",
 )
 
+PLAYER_STATS_COLUMNS = (
+    "season",
+    "team",
+    "player",
+    "minutes_played",
+    "goals",
+    "assists",
+    "shots_on_target",
+    "chances_created",
+    "updated_at",
+)
+
+PLAYER_STATS_COLUMN_ALIASES = {
+    "player": ("player_name",),
+    "minutes_played": ("minutes", "mins_played"),
+    "shots_on_target": ("shots_on_target_total", "shots_on_targets"),
+    "chances_created": ("key_passes",),
+}
+
+PLAYER_AVAILABILITY_COLUMNS = (
+    "season",
+    "team",
+    "player",
+    "status",
+    "updated_at",
+)
+
+PLAYER_AVAILABILITY_COLUMN_ALIASES = {
+    "player": ("player_name", "PLAYER_NAME"),
+    "status": ("availability_status", "current_status", "CURRENT_STATUS"),
+    "updated_at": ("availability_updated_at",),
+    "availability_weight": ("availability_probability", "availability_pct", "status_weight"),
+}
+
 DEFAULT_CANDIDATE_KEY_COLUMNS = ("season", "match_id")
 
 DEFAULT_CANDIDATE_REQUIRED_COLUMNS = (
@@ -59,6 +93,9 @@ DEFAULT_CANDIDATE_REQUIRED_COLUMNS = (
     "form_goal_diff_per_match_delta",
     "home_advantage_points_per_match_delta",
     "home_advantage_goal_diff_per_match_delta",
+    "player_influence_proxy_delta",
+    "availability_adjusted_player_influence_proxy_delta",
+    "player_availability_headwind_proxy_delta",
     "oldest_source_updated_at",
     "latest_source_updated_at",
 )
@@ -116,12 +153,247 @@ def _normalize_current_time(current_time: object | None) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
+def _normalize_optional_schema(
+    df: pd.DataFrame | None,
+    *,
+    df_name: str,
+    required_columns: Sequence[str],
+    column_aliases: dict[str, Sequence[str]],
+) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame(columns=list(required_columns))
+
+    normalized = df.copy()
+    rename_map: dict[str, str] = {}
+    for canonical_name, aliases in column_aliases.items():
+        if canonical_name in normalized.columns:
+            continue
+        for alias_name in aliases:
+            if alias_name in normalized.columns:
+                rename_map[alias_name] = canonical_name
+                break
+
+    if rename_map:
+        normalized = normalized.rename(columns=rename_map)
+
+    _require_columns(normalized, df_name, required_columns)
+    return normalized
+
+
+def _normalize_availability_weights(
+    availability: pd.DataFrame,
+) -> pd.Series:
+    raw_weights = (
+        pd.to_numeric(availability["availability_weight"], errors="coerce")
+        if "availability_weight" in availability.columns
+        else pd.Series(index=availability.index, dtype="Float64")
+    )
+    if not raw_weights.dropna().empty and raw_weights.dropna().abs().gt(1).any():
+        raw_weights = raw_weights / 100.0
+    raw_weights = raw_weights.clip(lower=0.0, upper=1.0)
+
+    statuses = availability["status"].fillna("").astype(str).str.strip().str.lower()
+    status_weights = pd.Series(1.0, index=availability.index, dtype="float64")
+    status_weights = status_weights.mask(statuses.str.contains("prob"), 0.9)
+    status_weights = status_weights.mask(statuses.str.contains("question"), 0.5)
+    status_weights = status_weights.mask(statuses.str.contains("doubt"), 0.25)
+    status_weights = status_weights.mask(
+        statuses.str.contains("out|unavailable|suspend|injur"),
+        0.0,
+    )
+    return raw_weights.fillna(status_weights).fillna(1.0)
+
+
+def _build_player_influence_proxy(player_stats: pd.DataFrame) -> pd.Series:
+    return (
+        player_stats["minutes_played"].fillna(0.0) / 900.0
+        + player_stats["goals"].fillna(0.0) * 2.0
+        + player_stats["assists"].fillna(0.0) * 1.5
+        + player_stats["shots_on_target"].fillna(0.0) * 0.15
+        + player_stats["chances_created"].fillna(0.0) * 0.10
+    )
+
+
+def _empty_player_team_features() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "season",
+            "team",
+            "player_total_influence_proxy",
+            "availability_adjusted_player_influence_proxy",
+            "player_availability_headwind_proxy",
+            "player_stats_updated_at",
+            "player_stats_updated_at_min",
+            "player_availability_updated_at",
+            "player_availability_updated_at_min",
+        ]
+    )
+
+
+def _build_player_team_features(
+    player_stats: pd.DataFrame | None,
+    player_availability: pd.DataFrame | None,
+) -> pd.DataFrame:
+    stats_copy = _normalize_optional_schema(
+        player_stats,
+        df_name="player_stats",
+        required_columns=PLAYER_STATS_COLUMNS,
+        column_aliases=PLAYER_STATS_COLUMN_ALIASES,
+    )
+    availability_copy = _normalize_optional_schema(
+        player_availability,
+        df_name="player_availability",
+        required_columns=PLAYER_AVAILABILITY_COLUMNS,
+        column_aliases=PLAYER_AVAILABILITY_COLUMN_ALIASES,
+    )
+
+    _assert_unique_key(stats_copy, "player_stats", ("season", "team", "player"))
+    _assert_unique_key(availability_copy, "player_availability", ("season", "team", "player"))
+
+    if stats_copy.empty and availability_copy.empty:
+        return _empty_player_team_features()
+
+    if not stats_copy.empty:
+        stats_copy["updated_at"] = _coerce_utc(stats_copy["updated_at"], "player_stats.updated_at")
+        stats_copy = _coerce_numeric(
+            stats_copy,
+            ("minutes_played", "goals", "assists", "shots_on_target", "chances_created"),
+        )
+        stats_copy["player_influence_proxy"] = _build_player_influence_proxy(stats_copy)
+        stats_team_summary = (
+            stats_copy.groupby(["season", "team"], as_index=False)
+            .agg(
+                player_total_influence_proxy=("player_influence_proxy", "sum"),
+                player_stats_updated_at=("updated_at", "max"),
+                player_stats_updated_at_min=("updated_at", "min"),
+            )
+            .reset_index(drop=True)
+        )
+    else:
+        stats_team_summary = _empty_player_team_features()[["season", "team"]].copy()
+        stats_team_summary["player_total_influence_proxy"] = pd.Series(dtype="float64")
+        stats_team_summary["player_stats_updated_at"] = pd.Series(dtype="datetime64[ns, UTC]")
+        stats_team_summary["player_stats_updated_at_min"] = pd.Series(dtype="datetime64[ns, UTC]")
+
+    if not availability_copy.empty:
+        availability_copy["updated_at"] = _coerce_utc(
+            availability_copy["updated_at"],
+            "player_availability.updated_at",
+        )
+        availability_copy["availability_weight"] = _normalize_availability_weights(availability_copy)
+        availability_team_summary = (
+            availability_copy.groupby(["season", "team"], as_index=False)
+            .agg(
+                player_availability_updated_at=("updated_at", "max"),
+                player_availability_updated_at_min=("updated_at", "min"),
+            )
+            .reset_index(drop=True)
+        )
+    else:
+        availability_team_summary = _empty_player_team_features()[["season", "team"]].copy()
+        availability_team_summary["player_availability_updated_at"] = pd.Series(
+            dtype="datetime64[ns, UTC]"
+        )
+        availability_team_summary["player_availability_updated_at_min"] = pd.Series(
+            dtype="datetime64[ns, UTC]"
+        )
+
+    if not stats_copy.empty:
+        joined_players = stats_copy.merge(
+            availability_copy[["season", "team", "player", "availability_weight"]],
+            on=["season", "team", "player"],
+            how="left",
+        )
+        joined_players["availability_weight"] = joined_players["availability_weight"].fillna(1.0)
+        joined_players["availability_adjusted_player_influence_proxy"] = (
+            joined_players["player_influence_proxy"] * joined_players["availability_weight"]
+        )
+        joined_players["player_availability_headwind_proxy"] = (
+            joined_players["player_influence_proxy"]
+            - joined_players["availability_adjusted_player_influence_proxy"]
+        )
+        joined_team_summary = (
+            joined_players.groupby(["season", "team"], as_index=False)
+            .agg(
+                availability_adjusted_player_influence_proxy=(
+                    "availability_adjusted_player_influence_proxy",
+                    "sum",
+                ),
+                player_availability_headwind_proxy=("player_availability_headwind_proxy", "sum"),
+            )
+            .reset_index(drop=True)
+        )
+    else:
+        joined_team_summary = _empty_player_team_features()[["season", "team"]].copy()
+        joined_team_summary["availability_adjusted_player_influence_proxy"] = pd.Series(dtype="float64")
+        joined_team_summary["player_availability_headwind_proxy"] = pd.Series(dtype="float64")
+
+    player_team_features = stats_team_summary.merge(
+        joined_team_summary,
+        on=["season", "team"],
+        how="outer",
+    )
+    player_team_features = player_team_features.merge(
+        availability_team_summary,
+        on=["season", "team"],
+        how="outer",
+    )
+
+    for column_name in (
+        "player_total_influence_proxy",
+        "availability_adjusted_player_influence_proxy",
+        "player_availability_headwind_proxy",
+    ):
+        player_team_features[column_name] = (
+            pd.to_numeric(player_team_features[column_name], errors="coerce").fillna(0.0)
+        )
+
+    return player_team_features
+
+
+def _rename_player_side_columns(candidate_rows: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {
+        "home_player_player_total_influence_proxy": "home_player_influence_proxy",
+        "away_player_player_total_influence_proxy": "away_player_influence_proxy",
+        "home_player_availability_adjusted_player_influence_proxy": (
+            "home_player_availability_adjusted_influence_proxy"
+        ),
+        "away_player_availability_adjusted_player_influence_proxy": (
+            "away_player_availability_adjusted_influence_proxy"
+        ),
+        "home_player_player_availability_headwind_proxy": "home_player_availability_headwind_proxy",
+        "away_player_player_availability_headwind_proxy": "away_player_availability_headwind_proxy",
+        "home_player_player_stats_updated_at": "home_player_stats_updated_at",
+        "away_player_player_stats_updated_at": "away_player_stats_updated_at",
+        "home_player_player_stats_updated_at_min": "home_player_stats_updated_at_min",
+        "away_player_player_stats_updated_at_min": "away_player_stats_updated_at_min",
+        "home_player_player_availability_updated_at": "home_player_availability_updated_at",
+        "away_player_player_availability_updated_at": "away_player_availability_updated_at",
+        "home_player_player_availability_updated_at_min": "home_player_availability_updated_at_min",
+        "away_player_player_availability_updated_at_min": "away_player_availability_updated_at_min",
+    }
+    return candidate_rows.rename(columns=rename_map)
+
+
+def _rowwise_datetime_reduce(df: pd.DataFrame, reducer: str) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="datetime64[ns, UTC]")
+    return df.apply(
+        lambda row: getattr(row.dropna(), reducer)() if row.dropna().shape[0] else pd.NaT,
+        axis=1,
+    )
+
+
 def build_matchup_features(
     fixtures: pd.DataFrame,
     team_strength: pd.DataFrame,
     team_form: pd.DataFrame,
+    player_stats: pd.DataFrame | None = None,
+    player_availability: pd.DataFrame | None = None,
     *,
     feature_generated_at: object | None = None,
+    availability: pd.DataFrame | None = None,
+    injury_availability: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Join EPL ingest tables into one candidate-ready feature row per matchup.
 
@@ -130,7 +402,17 @@ def build_matchup_features(
     - team_strength: season, team, matches_played, points, goal_diff, goals_for, goals_against,
       home_matches, home_points, home_goal_diff, away_matches, away_points, away_goal_diff, updated_at
     - team_form: season, team, window_matches, window_points, window_goal_diff, updated_at
+    - player_stats (optional): season, team, player, minutes_played, goals, assists,
+      shots_on_target, chances_created, updated_at
+    - player_availability / availability / injury_availability (optional): season, team, player,
+      status, updated_at, with an optional availability_weight / availability_probability column
     """
+
+    availability_sources = [source for source in (player_availability, availability, injury_availability) if source is not None]
+    if len(availability_sources) > 1:
+        raise ValueError("Provide only one of player_availability, availability, or injury_availability")
+    if player_availability is None:
+        player_availability = availability if availability is not None else injury_availability
 
     _require_columns(fixtures, "fixtures", FIXTURE_COLUMNS)
     _require_columns(team_strength, "team_strength", TEAM_STRENGTH_COLUMNS)
@@ -221,10 +503,14 @@ def build_matchup_features(
         ]
     ]
 
+    player_team_features = _build_player_team_features(player_stats, player_availability)
+
     home_strength = _rename_for_side(strength_features, "home_team", "home_strength")
     away_strength = _rename_for_side(strength_features, "away_team", "away_strength")
     home_form = _rename_for_side(form_features, "home_team", "home_form")
     away_form = _rename_for_side(form_features, "away_team", "away_form")
+    home_player_features = _rename_for_side(player_team_features, "home_team", "home_player")
+    away_player_features = _rename_for_side(player_team_features, "away_team", "away_player")
 
     candidate_rows = fixtures_copy.merge(
         home_strength,
@@ -246,6 +532,31 @@ def build_matchup_features(
         on=["season", "away_team"],
         how="left",
     )
+    candidate_rows = candidate_rows.merge(
+        home_player_features,
+        on=["season", "home_team"],
+        how="left",
+    )
+    candidate_rows = candidate_rows.merge(
+        away_player_features,
+        on=["season", "away_team"],
+        how="left",
+    )
+    candidate_rows = candidate_rows.rename(columns={"updated_at": "fixtures_updated_at"})
+    candidate_rows = _rename_player_side_columns(candidate_rows)
+
+    for column_name in (
+        "home_player_influence_proxy",
+        "away_player_influence_proxy",
+        "home_player_availability_adjusted_influence_proxy",
+        "away_player_availability_adjusted_influence_proxy",
+        "home_player_availability_headwind_proxy",
+        "away_player_availability_headwind_proxy",
+    ):
+        candidate_rows[column_name] = pd.to_numeric(
+            candidate_rows[column_name],
+            errors="coerce",
+        ).fillna(0.0)
 
     candidate_rows["strength_points_per_match_delta"] = (
         candidate_rows["home_strength_strength_points_per_match"]
@@ -279,24 +590,54 @@ def build_matchup_features(
         candidate_rows["home_strength_home_goal_diff_per_match"]
         - candidate_rows["away_strength_away_goal_diff_per_match"]
     )
+    candidate_rows["player_influence_proxy_delta"] = (
+        candidate_rows["home_player_influence_proxy"] - candidate_rows["away_player_influence_proxy"]
+    )
+    candidate_rows["availability_adjusted_player_influence_proxy_delta"] = (
+        candidate_rows["home_player_availability_adjusted_influence_proxy"]
+        - candidate_rows["away_player_availability_adjusted_influence_proxy"]
+    )
+    candidate_rows["player_availability_headwind_proxy_delta"] = (
+        candidate_rows["home_player_availability_headwind_proxy"]
+        - candidate_rows["away_player_availability_headwind_proxy"]
+    )
     candidate_rows["result_goal_diff"] = candidate_rows["home_score"] - candidate_rows["away_score"]
     candidate_rows["result_total_goals"] = candidate_rows["home_score"] + candidate_rows["away_score"]
     candidate_rows["result_home_win"] = (candidate_rows["result_goal_diff"] > 0).astype("Int64")
     candidate_rows["result_draw"] = (candidate_rows["result_goal_diff"] == 0).astype("Int64")
     candidate_rows["result_away_win"] = (candidate_rows["result_goal_diff"] < 0).astype("Int64")
 
-    timestamp_columns = [
-        "updated_at",
+    oldest_timestamp_columns = [
+        "fixtures_updated_at",
         "home_strength_updated_at",
         "away_strength_updated_at",
         "home_form_updated_at",
         "away_form_updated_at",
+        "home_player_stats_updated_at_min",
+        "away_player_stats_updated_at_min",
+        "home_player_availability_updated_at_min",
+        "away_player_availability_updated_at_min",
     ]
-    candidate_rows = candidate_rows.rename(columns={"updated_at": "fixtures_updated_at"})
-    timestamp_columns[0] = "fixtures_updated_at"
+    latest_timestamp_columns = [
+        "fixtures_updated_at",
+        "home_strength_updated_at",
+        "away_strength_updated_at",
+        "home_form_updated_at",
+        "away_form_updated_at",
+        "home_player_stats_updated_at",
+        "away_player_stats_updated_at",
+        "home_player_availability_updated_at",
+        "away_player_availability_updated_at",
+    ]
 
-    candidate_rows["oldest_source_updated_at"] = candidate_rows[timestamp_columns].min(axis=1)
-    candidate_rows["latest_source_updated_at"] = candidate_rows[timestamp_columns].max(axis=1)
+    candidate_rows["oldest_source_updated_at"] = _rowwise_datetime_reduce(
+        candidate_rows[oldest_timestamp_columns],
+        "min",
+    )
+    candidate_rows["latest_source_updated_at"] = _rowwise_datetime_reduce(
+        candidate_rows[latest_timestamp_columns],
+        "max",
+    )
     candidate_rows["feature_generated_at"] = _normalize_current_time(feature_generated_at)
 
     ordered_columns = [
@@ -315,6 +656,9 @@ def build_matchup_features(
         "form_goal_diff_per_match_delta",
         "home_advantage_points_per_match_delta",
         "home_advantage_goal_diff_per_match_delta",
+        "player_influence_proxy_delta",
+        "availability_adjusted_player_influence_proxy_delta",
+        "player_availability_headwind_proxy_delta",
         "result_goal_diff",
         "result_total_goals",
         "result_home_win",
@@ -325,6 +669,10 @@ def build_matchup_features(
         "away_strength_updated_at",
         "home_form_updated_at",
         "away_form_updated_at",
+        "home_player_stats_updated_at",
+        "away_player_stats_updated_at",
+        "home_player_availability_updated_at",
+        "away_player_availability_updated_at",
         "oldest_source_updated_at",
         "latest_source_updated_at",
         "feature_generated_at",
